@@ -1,0 +1,51 @@
+name: CI musl static build
+
+# Fast sanity check: build the fully-static musl binaries on x86_64 for every
+# push / pull request, so the release pipeline never hits a surprise.
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  ALPINE_VERSION: '3.22'
+
+concurrency:
+  group: ci-musl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-static-x86_64:
+    name: alpine musl static (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build static binaries
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            -e TARGET_ARCH=x86_64 \
+            -e HOST_UID=$(id -u) \
+            -e HOST_GID=$(id -g) \
+            -v "${{ github.workspace }}":/src \
+            -w /src \
+            alpine:${{ env.ALPINE_VERSION }} \
+            sh ci/build-musl-static.sh
+
+      - name: Package (sanity check)
+        run: ./ci/package-musl.sh x86_64
+
+      - name: Show package contents
+        run: |
+          tar -tzf out/*.tar.gz
+          sha256sum out/*

@@ -1,0 +1,155 @@
+name: Release static musl builds
+
+# Build fully-static (musl libc) zmap binaries for every architecture Alpine
+# Linux supports and publish them to GitHub Releases.
+#
+# Triggers:
+#   * pushing a tag  v*      -> release named after the tag
+#   * manual dispatch        -> upload to input tag, or refresh the `nightly`
+#                               pre-release when no tag is given
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build & upload to (leave empty to refresh the nightly pre-release)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  ALPINE_VERSION: '3.22'
+
+concurrency:
+  group: release-musl-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: musl static · ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Exotic architectures are best-effort: failures there do not block the
+    # release of the main architectures.
+    continue-on-error: ${{ matrix.optional == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- required architectures ---
+          - { arch: x86_64,  platform: linux/amd64 }
+          - { arch: i386,    platform: linux/386 }
+          - { arch: aarch64, platform: linux/arm64 }
+          - { arch: armv7,   platform: linux/arm/v7 }
+          # --- best-effort architectures ---
+          - { arch: riscv64, platform: linux/riscv64, optional: true }
+          - { arch: ppc64le, platform: linux/ppc64le, optional: true }
+          - { arch: s390x,   platform: linux/s390x,   optional: true }
+
+    steps:
+      - name: Checkout (full history, tags included)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU (cross-architecture emulation)
+        if: matrix.platform != 'linux/amd64' && matrix.platform != 'linux/386'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.platform }}
+
+      - name: Build static binaries (Alpine ${{ env.ALPINE_VERSION }}, ${{ matrix.arch }})
+        run: |
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            -e TARGET_ARCH=${{ matrix.arch }} \
+            -e HOST_UID=$(id -u) \
+            -e HOST_GID=$(id -g) \
+            -v "${{ github.workspace }}":/src \
+            -w /src \
+            alpine:${{ env.ALPINE_VERSION }} \
+            sh ci/build-musl-static.sh
+
+      - name: Package release tarball
+        run: ./ci/package-musl.sh ${{ matrix.arch }}
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zmap-linux-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish to GitHub Releases
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Collect all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd assets
+          sha256sum *.tar.gz > SHA256SUMS
+          echo "== SHA256SUMS =="
+          cat SHA256SUMS
+
+      - name: Determine release tag
+        id: meta
+        env:
+          EVENT_INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "$EVENT_INPUT_TAG" ]; then
+            TAG="$EVENT_INPUT_TAG"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="nightly"
+          fi
+          if [ "$TAG" = "nightly" ]; then
+            NIGHTLY=true
+            BODY=$(printf 'Automated fully-static musl builds of zmap at commit %s.\n\nArchitectures: x86_64, i386, aarch64, armv7 (best effort: riscv64, ppc64le, s390x).\nEach tarball contains zmap, zblocklist, ziterate and ztee plus a README. SHA256 checksums are in SHA256SUMS.' "${GITHUB_SHA}")
+          else
+            NIGHTLY=false
+            BODY=''
+          fi
+          {
+            echo "tag=$TAG"
+            echo "nightly=$NIGHTLY"
+            echo "body<<BODY_EOF"
+            printf '%s\n' "$BODY"
+            echo "BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "release tag: $TAG (nightly=$NIGHTLY)"
+
+      - name: Remove previous nightly release
+        if: steps.meta.outputs.nightly == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag || true
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.nightly == 'true' && 'zmap nightly (static musl builds)' || format('zmap {0} - static musl builds', steps.meta.outputs.tag) }}
+          prerelease: ${{ steps.meta.outputs.nightly == 'true' }}
+          make_latest: ${{ steps.meta.outputs.nightly == 'true' && 'false' || 'true' }}
+          generate_release_notes: ${{ steps.meta.outputs.nightly != 'true' }}
+          body: ${{ steps.meta.outputs.body }}
+          fail_on_unmatched_files: true
+          files: assets/*
