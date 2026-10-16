@@ -20,9 +20,6 @@ set -eux
 
 : "${TARGET_ARCH:?TARGET_ARCH must be set (e.g. x86_64)}"
 
-# The workspace is bind-mounted and owned by the CI user, not by root.
-git config --global --add safe.directory '*' || true
-
 echo "==> container uname -m: $(uname -m) | target arch: ${TARGET_ARCH}"
 
 # ---------------------------------------------------------------------------
@@ -40,6 +37,12 @@ apk add --no-cache \
     gmp-dev gmp-static \
     libunistring-dev libunistring-static \
     zlib-static
+
+# The workspace is bind-mounted and owned by the CI user, not by root.
+# zmap embeds `git log` output (build commit) via CMakeVersion.txt at build
+# time, so git must be allowed to operate on the repository first.
+git config --global --add safe.directory '*'
+git log -n 1 --pretty=format:"build commit: %h - %ad" || true
 
 # ---------------------------------------------------------------------------
 # Configure: force CMake to look for static archives and link statically.
